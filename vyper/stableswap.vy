@@ -39,16 +39,14 @@ RemoveLiquidity: event({provider: indexed(address), token_amounts: uint256[N_COI
 RemoveLiquidityImbalance: event({provider: indexed(address), token_amounts: uint256[N_COINS], fees: uint256[N_COINS], invariant: uint256, token_supply: uint256})
 CommitNewAdmin: event({deadline: indexed(timestamp), admin: indexed(address)})
 NewAdmin: event({admin: indexed(address)})
-CommitNewParameters: event({deadline: indexed(timestamp), A: uint256, fee: uint256, admin_fee: uint256})
-NewParameters: event({A: uint256, fee: uint256, admin_fee: uint256})
+CommitNewParameters: event({deadline: indexed(timestamp), A: uint256, fee: uint256})
+NewParameters: event({A: uint256, fee: uint256})
 
 coins: public(address[N_COINS])
 underlying_coins: public(address[N_COINS])
 balances: public(uint256[N_COINS])
 A: public(uint256)  # 2 x amplification coefficient
 fee: public(uint256)  # fee * 1e10
-admin_fee: public(uint256)  # admin_fee * 1e10
-max_admin_fee: constant(uint256) = 5 * 10 ** 9
 
 owner: public(address)
 token: ERC20m
@@ -57,7 +55,6 @@ admin_actions_deadline: public(timestamp)
 transfer_ownership_deadline: public(timestamp)
 future_A: public(uint256)
 future_fee: public(uint256)
-future_admin_fee: public(uint256)
 future_owner: public(address)
 
 kill_deadline: timestamp
@@ -84,7 +81,6 @@ def __init__(_coins: address[N_COINS], _underlying_coins: address[N_COINS],
     self.underlying_coins = _underlying_coins
     self.A = _A
     self.fee = _fee
-    self.admin_fee = 0
     self.owner = msg.sender
     self.kill_deadline = block.timestamp + kill_deadline_dt
     self.is_killed = False
@@ -223,7 +219,6 @@ def add_liquidity(amounts: uint256[N_COINS], min_mint_amount: uint256):
     use_lending: bool[N_COINS] = USE_LENDING
     fees: uint256[N_COINS] = ZEROS
     _fee: uint256 = self.fee * N_COINS / (4 * (N_COINS - 1))
-    _admin_fee: uint256 = self.admin_fee
 
     token_supply: uint256 = self.token.totalSupply()
     rates: uint256[N_COINS] = self._current_rates()
@@ -257,7 +252,7 @@ def add_liquidity(amounts: uint256[N_COINS], min_mint_amount: uint256):
             else:
                 difference = new_balances[i] - ideal_balance
             fees[i] = _fee * difference / FEE_DENOMINATOR
-            self.balances[i] = new_balances[i] - fees[i] * _admin_fee / FEE_DENOMINATOR
+            self.balances[i] = new_balances[i]
             new_balances[i] -= fees[i]
         D2 = self.get_D_mem(rates, new_balances)
     else:
@@ -392,9 +387,8 @@ def _exchange(i: int128, j: int128, dx: uint256, rates: uint256[N_COINS]) -> uin
     y: uint256 = self.get_y(i, j, x, xp)
     dy: uint256 = xp[j] - y
     dy_fee: uint256 = dy * self.fee / FEE_DENOMINATOR
-    dy_admin_fee: uint256 = dy_fee * self.admin_fee / FEE_DENOMINATOR
     self.balances[i] = x * PRECISION / rates[i]
-    self.balances[j] = (y + (dy_fee - dy_admin_fee)) * PRECISION / rates[j]
+    self.balances[j] = (y + dy_fee * PRECISION / rates[j]
 
     _dy: uint256 = (dy - dy_fee) * PRECISION / rates[j]
 
@@ -497,7 +491,6 @@ def remove_liquidity_imbalance(amounts: uint256[N_COINS], max_burn_amount: uint2
     token_supply: uint256 = self.token.totalSupply()
     assert token_supply > 0
     _fee: uint256 = self.fee * N_COINS / (4 * (N_COINS - 1))
-    _admin_fee: uint256 = self.admin_fee
     rates: uint256[N_COINS] = self._current_rates()
 
     old_balances: uint256[N_COINS] = self.balances
@@ -515,7 +508,7 @@ def remove_liquidity_imbalance(amounts: uint256[N_COINS], max_burn_amount: uint2
         else:
             difference = new_balances[i] - ideal_balance
         fees[i] = _fee * difference / FEE_DENOMINATOR
-        self.balances[i] = new_balances[i] - fees[i] * _admin_fee / FEE_DENOMINATOR
+        self.balances[i] = new_balances[i]
         new_balances[i] -= fees[i]
     D2: uint256 = self.get_D_mem(rates, new_balances)
 
@@ -536,19 +529,16 @@ def remove_liquidity_imbalance(amounts: uint256[N_COINS], max_burn_amount: uint2
 ### Admin functions ###
 @public
 def commit_new_parameters(amplification: uint256,
-                          new_fee: uint256,
-                          new_admin_fee: uint256):
+                          new_fee: uint256):
     assert msg.sender == self.owner
     assert self.admin_actions_deadline == 0
-    assert new_admin_fee <= max_admin_fee
 
     _deadline: timestamp = block.timestamp + admin_actions_delay
     self.admin_actions_deadline = _deadline
     self.future_A = amplification
     self.future_fee = new_fee
-    self.future_admin_fee = new_admin_fee
 
-    log.CommitNewParameters(_deadline, amplification, new_fee, new_admin_fee)
+    log.CommitNewParameters(_deadline, amplification, new_fee)
 
 
 @public
@@ -560,12 +550,10 @@ def apply_new_parameters():
     self.admin_actions_deadline = 0
     _A: uint256 = self.future_A
     _fee: uint256 = self.future_fee
-    _admin_fee: uint256 = self.future_admin_fee
     self.A = _A
     self.fee = _fee
-    self.admin_fee = _admin_fee
 
-    log.NewParameters(_A, _fee, _admin_fee)
+    log.NewParameters(_A, _fee)
 
 
 @public
@@ -605,24 +593,6 @@ def revert_transfer_ownership():
     assert msg.sender == self.owner
 
     self.transfer_ownership_deadline = 0
-
-
-@public
-def withdraw_admin_fees():
-    assert msg.sender == self.owner
-    _precisions: uint256[N_COINS] = PRECISION_MUL
-    tethered: bool[N_COINS] = TETHERED
-    use_lending: bool[N_COINS] = USE_LENDING
-
-    for i in range(N_COINS):
-        c: address = self.coins[i]
-        value: uint256 = cERC20(c).balanceOf(self) - self.balances[i]
-        if value > 0:
-            if tethered[i] and not use_lending[i]:
-                USDT(c).transfer(msg.sender, value)
-            else:
-                assert_modifiable(cERC20(c).transfer(msg.sender, value))
-
 
 @public
 def kill_me():
